@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Catalogo Libri</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; background: #f6f5f2; color: #222; }
+  h1 { font-size: 1.3rem; margin: 4px 0 12px; }
+  .row { display: flex; gap: 8px; margin: 8px 0; }
+  input, button { font-size: 1rem; padding: 10px; border-radius: 8px; border: 1px solid #bbb; }
+  input { flex: 1; min-width: 0; }
+  button { background: #2b5d8a; color: #fff; border: 0; }
+  button.sec { background: #777; }
+  #reader { background: #fff; border-radius: 8px; overflow: hidden; }
+  #msg { min-height: 1.4em; font-weight: 600; margin: 8px 0; }
+  .book { display: flex; gap: 10px; background: #fff; padding: 10px; border-radius: 8px; margin: 8px 0; }
+  .book img { width: 60px; height: 90px; object-fit: cover; background: #ddd; flex-shrink: 0; }
+  .book .info { flex: 1; min-width: 0; font-size: .9rem; }
+  .book b { font-size: 1rem; }
+  .book small { color: #666; }
+  .book button { background: #a33; padding: 4px 10px; align-self: flex-start; }
+  details { color: #444; }
+  .big { display: block; text-align: center; background: #2b5d8a; color: #fff; font-size: 1.2rem; font-weight: 600; padding: 18px; border-radius: 10px; margin-bottom: 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>📚 Catalogo Libri <small id="count"></small></h1>
+
+<label class="big">📷 Fotografa il codice a barre
+  <input id="photo" type="file" accept="image/*" capture="environment" hidden>
+</label>
+<div id="file-reader" hidden></div>
+<div id="reader"></div>
+
+<div class="row">
+  <input id="loc" placeholder="Collocazione (es. Scaffale A3)">
+</div>
+<div class="row">
+  <input id="isbn" inputmode="numeric" placeholder="ISBN a mano">
+  <button onclick="handle(document.getElementById('isbn').value)">Aggiungi</button>
+</div>
+<div id="msg"></div>
+
+<div class="row">
+  <input id="q" placeholder="Cerca titolo, autore, ISBN…" oninput="render()">
+  <button class="sec" onclick="exportCsv()">Esporta CSV</button>
+</div>
+<div id="list"></div>
+
+<script>
+const KEY = 'catalogo-libri';
+let books = JSON.parse(localStorage.getItem(KEY) || '[]');
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+$('loc').value = localStorage.getItem(KEY + '-loc') || '';
+$('loc').oninput = () => localStorage.setItem(KEY + '-loc', $('loc').value);
+
+function check13(d12) { let s = 0; for (let i = 0; i < 12; i++) s += +d12[i] * (i % 2 ? 3 : 1); return (10 - s % 10) % 10; }
+// Accepts ISBN-13 (scanned EAN) or ISBN-10 (typed); returns a valid ISBN-13 or null.
+// shortcut: ISBN-10 check digit is not verified, only converted.
+function normIsbn(raw) {
+  const s = String(raw).replace(/[^0-9X]/gi, '').toUpperCase();
+  if (/^\d{9}[\dX]$/.test(s)) { const b = '978' + s.slice(0, 9); return b + check13(b); }
+  if (/^97[89]\d{10}$/.test(s) && check13(s) === +s[12]) return s;
+  return null;
+}
+console.assert(normIsbn('9788804668237') === '9788804668237', 'isbn13 ok');
+console.assert(normIsbn('9788804668238') === null, 'isbn13 bad checksum');
+console.assert(normIsbn('88-04-66823-X') === '9788804668237', 'isbn10 → 13');
+console.assert(normIsbn('4006381333931') === null, 'EAN non-libro');
+
+async function lookup(isbn) {
+  const cover = `https://covers.openlibrary.org/b/isbn/${isbn}-M.jpg?default=false`;
+  try {
+    const r = await fetch('https://www.googleapis.com/books/v1/volumes?q=isbn:' + isbn).then(r => r.json());
+    const v = r.items?.[0]?.volumeInfo;
+    if (v) return {
+      titolo: v.title + (v.subtitle ? ': ' + v.subtitle : ''), autori: (v.authors || []).join(', '),
+      editore: v.publisher || '', anno: (v.publishedDate || '').slice(0, 4), pagine: v.pageCount || '',
+      lingua: v.language || '', categorie: (v.categories || []).join(', '), descrizione: v.description || '',
+      copertina: (v.imageLinks?.thumbnail || '').replace('http:', 'https:') || cover };
+  } catch (e) {}
+  try {
+    const r = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`).then(r => r.json());
+    const v = r['ISBN:' + isbn];
+    if (v) return {
+      titolo: v.title + (v.subtitle ? ': ' + v.subtitle : ''), autori: (v.authors || []).map(a => a.name).join(', '),
+      editore: (v.publishers || []).map(p => p.name).join(', '), anno: (v.publish_date || '').match(/\d{4}/)?.[0] || '',
+      pagine: v.number_of_pages || '', lingua: '', categorie: (v.subjects || []).slice(0, 3).map(s => s.name).join(', '),
+      descrizione: '', copertina: v.cover?.medium || cover };
+  } catch (e) {}
+  return null;
+}
+
+let busy = false, last = '';
+async function handle(raw) {
+  const isbn = normIsbn(raw);
+  if (!isbn) { if (raw && !busy) $('msg').textContent = '⚠️ Non è un ISBN valido: ' + raw; return; }
+  if (busy || isbn === last) return; // the scanner fires many times per second on the same code
+  busy = true; last = isbn;
+  try {
+    if (books.some(b => b.isbn === isbn) && !confirm(`ISBN ${isbn} è già in catalogo. Aggiungere un'altra copia?`)) return;
+    $('msg').textContent = '🔎 Cerco ' + isbn + '…';
+    let data = await lookup(isbn);
+    if (!data) {
+      const t = prompt(`Nessun dato trovato per ${isbn}. Titolo (vuoto = annulla):`);
+      if (!t) { $('msg').textContent = ''; return; }
+      data = { titolo: t, autori: prompt('Autore/i:') || '' };
+    }
+    books.unshift({ isbn, ...data, collocazione: $('loc').value, aggiunto: new Date().toISOString() });
+    localStorage.setItem(KEY, JSON.stringify(books));
+    $('msg').textContent = '✅ ' + data.titolo;
+    $('isbn').value = '';
+    navigator.vibrate?.(150);
+    render();
+  } finally { busy = false; }
+}
+
+function del(i) {
+  if (!confirm('Eliminare "' + books[i].titolo + '"?')) return;
+  books.splice(i, 1);
+  localStorage.setItem(KEY, JSON.stringify(books));
+  if (last && !books.some(b => b.isbn === last)) last = '';
+  render();
+}
+
+function render() {
+  const q = $('q').value.toLowerCase();
+  $('count').textContent = `(${books.length})`;
+  $('list').innerHTML = books.map((b, i) => [b, i])
+    .filter(([b]) => !q || [b.titolo, b.autori, b.isbn, b.editore, b.collocazione].join(' ').toLowerCase().includes(q))
+    .map(([b, i]) => `<div class="book">
+      <img src="${esc(b.copertina)}" alt="" onerror="this.style.visibility='hidden'">
+      <div class="info"><b>${esc(b.titolo)}</b><br>${esc(b.autori)}<br>
+        <small>${esc(b.editore)} ${esc(b.anno)} · ${b.pagine ? esc(b.pagine) + ' pp · ' : ''}ISBN ${esc(b.isbn)}${b.collocazione ? ' · 📍 ' + esc(b.collocazione) : ''}</small>
+        ${b.descrizione ? `<details><summary>Descrizione</summary>${esc(b.descrizione)}</details>` : ''}</div>
+      <button onclick="del(${i})" aria-label="Elimina">✕</button></div>`).join('');
+}
+
+function exportCsv() {
+  const cols = ['isbn', 'titolo', 'autori', 'editore', 'anno', 'pagine', 'lingua', 'categorie', 'collocazione', 'descrizione', 'copertina', 'aggiunto'];
+  const cell = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const csv = [cols.join(';'), ...books.map(b => cols.map(c => cell(b[c])).join(';'))].join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' })); // BOM so Excel reads accents
+  a.download = `catalogo-libri-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+}
+
+render();
+try { localStorage.setItem(KEY + '-test', '1'); } catch (e) { $('msg').textContent = '⚠️ Questo browser non può salvare i dati: apri l\'app da un indirizzo https://'; }
+
+// Native camera via file input: needs no camera permission, works even without HTTPS.
+$('photo').onchange = async () => {
+  const f = $('photo').files[0];
+  $('photo').value = '';
+  if (!f) return;
+  $('msg').textContent = '🔎 Leggo il codice…';
+  try {
+    const code = await new Html5Qrcode('file-reader', { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13] }).scanFile(f, false);
+    last = ''; // a deliberate photo may re-add the same book
+    await handle(code);
+  } catch (e) {
+    $('msg').textContent = '⚠️ Codice non leggibile: rifai la foto più vicina e dritta, o scrivi l\'ISBN a mano.';
+  }
+};
+
+if (window.Html5QrcodeScanner && window.isSecureContext) {
+  new Html5QrcodeScanner('reader', {
+    fps: 10, qrbox: { width: 260, height: 120 }, rememberLastUsedCamera: true,
+    formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13],
+  }, false).render(text => handle(text), () => {});
+} else if (!window.Html5Qrcode) {
+  $('reader').textContent = 'Scanner non caricato (serve internet). Puoi inserire l\'ISBN a mano.';
+}
+</script>
+</body>
+</html>
